@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# Lahman cache (downloaded automatically at runtime)
+lahman_cache/
+
+# Pipeline outputs (generated at runtime)
+outputs/
+
+# VS Code / OS
+.vscode/
+.DS_Store
+Thumbs.db
