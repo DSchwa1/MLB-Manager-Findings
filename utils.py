@@ -16,23 +16,44 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(CHARTS_DIR, exist_ok=True)
 
 # ── HTTP / rate-limiting ───────────────────────────────────────────────────────
-BBREF_DELAY = 2.0   # mandatory seconds between all BBRef requests
+BBREF_DELAY = 4.0   # seconds between BBRef requests (increased to reduce 403s)
 
+# Full browser-like headers to minimise 403 blocks from BBRef
 HEADERS = {
     'User-Agent': (
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
         'AppleWebKit/537.36 (KHTML, like Gecko) '
         'Chrome/124.0.0.0 Safari/537.36'
-    )
+    ),
+    'Accept': (
+        'text/html,application/xhtml+xml,application/xml;'
+        'q=0.9,image/avif,image/webp,*/*;q=0.8'
+    ),
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Referer': 'https://www.baseball-reference.com/',
 }
+
+# Single shared session — keeps cookies across requests, looks more like a browser
+_SESSION = requests.Session()
+_SESSION.headers.update(HEADERS)
 
 
 def bbref_get(url, session=None):
-    """Fetch a BBRef URL with mandatory 2-second delay. Returns Response or None."""
-    time.sleep(BBREF_DELAY)
-    requester = session if session is not None else requests
+    """Fetch a BBRef URL with mandatory delay. Returns Response or None."""
+    import random
+    # Random jitter on top of base delay makes scraping pattern less detectable
+    time.sleep(BBREF_DELAY + random.uniform(0.5, 2.0))
+    requester = session if session is not None else _SESSION
     try:
-        resp = requester.get(url, headers=HEADERS, timeout=30)
+        resp = requester.get(url, timeout=30)
+        if resp.status_code == 403:
+            # Back off and retry once with a longer wait
+            log_audit(f"403 on {url} — waiting 15s and retrying once.", "WARNING")
+            time.sleep(15)
+            resp = requester.get(url, timeout=30)
         resp.raise_for_status()
         return resp
     except Exception as exc:
@@ -47,6 +68,101 @@ def log_audit(message, category="NOTE"):
     line = f"[{ts}] [{category}] {message}\n"
     with open(AUDIT_FILE, 'a', encoding='utf-8') as fh:
         fh.write(line)
+
+
+# ── MLB Stats API team ID mapping ─────────────────────────────────────────────
+# BBRef abbreviation -> MLB Stats API numeric team ID
+# Used by get_mlb_game_log() as primary data source (no scraping needed)
+BBREF_TO_MLB_ID = {
+    'ARI': 109, 'ATL': 144, 'BAL': 110, 'BOS': 111, 'CHC': 112,
+    'CWS': 145, 'CIN': 113, 'CLE': 114, 'COL': 115, 'DET': 116,
+    'HOU': 117, 'KCR': 118, 'LAD': 119, 'LAA': 108, 'ANA': 108,
+    'MIA': 146, 'FLA': 146, 'MIL': 158, 'MIN': 142, 'NYM': 121,
+    'NYY': 147, 'OAK': 133, 'PHI': 143, 'PIT': 134, 'SDP': 135,
+    'SEA': 136, 'SFG': 137, 'STL': 138, 'TBR': 139, 'TBD': 139,
+    'TEX': 140, 'TOR': 141, 'WSN': 120, 'MON': 120,
+}
+
+MLB_API_BASE = 'https://statsapi.mlb.com/api/v1'
+
+_mlb_api_cache = {}
+
+
+def get_mlb_game_log(year, bbref_team):
+    """
+    Fetch a full-season game log from the MLB Stats API (no scraping).
+    Returns a cleaned DataFrame with columns:
+      game_number, game_date, runs_scored, runs_allowed, result
+    or an empty DataFrame on failure.
+    """
+    import pandas as pd
+    from datetime import date
+
+    key = (year, bbref_team)
+    if key in _mlb_api_cache:
+        return _mlb_api_cache[key]
+
+    team_id = BBREF_TO_MLB_ID.get(bbref_team)
+    if team_id is None:
+        log_audit(f'No MLB API team ID for {bbref_team}', 'WARNING')
+        _mlb_api_cache[key] = pd.DataFrame()
+        return pd.DataFrame()
+
+    url = (f'{MLB_API_BASE}/schedule?sportId=1&season={year}'
+           f'&teamId={team_id}&gameType=R&hydrate=linescore')
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log_audit(f'MLB API error for {bbref_team} {year}: {exc}', 'ERROR')
+        _mlb_api_cache[key] = pd.DataFrame()
+        return pd.DataFrame()
+
+    rows = []
+    game_num = 0
+    for date_entry in sorted(data.get('dates', []), key=lambda d: d['date']):
+        for game in date_entry.get('games', []):
+            # Skip postponed / suspended games with no result
+            status = game.get('status', {}).get('abstractGameState', '')
+            if status not in ('Final',):
+                continue
+
+            linescore = game.get('linescore', {})
+            teams     = linescore.get('teams', {})
+            home_id   = game.get('teams', {}).get('home', {}).get('team', {}).get('id')
+            away_id   = game.get('teams', {}).get('away', {}).get('team', {}).get('id')
+
+            if home_id == team_id:
+                rs = teams.get('home', {}).get('runs')
+                ra = teams.get('away', {}).get('runs')
+            else:
+                rs = teams.get('away', {}).get('runs')
+                ra = teams.get('home', {}).get('runs')
+
+            if rs is None or ra is None:
+                continue
+
+            rs, ra = int(rs), int(ra)
+            result = 'W' if rs > ra else ('L' if rs < ra else 'T')
+
+            try:
+                gdate = date.fromisoformat(date_entry['date'])
+            except Exception:
+                gdate = None
+
+            game_num += 1
+            rows.append({
+                'game_number':  game_num,
+                'game_date':    gdate,
+                'runs_scored':  rs,
+                'runs_allowed': ra,
+                'result':       result,
+            })
+
+    df = pd.DataFrame(rows)
+    _mlb_api_cache[key] = df
+    return df
 
 
 # ── Team-ID mapping ────────────────────────────────────────────────────────────

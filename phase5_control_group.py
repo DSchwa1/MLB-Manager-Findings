@@ -35,106 +35,104 @@ POST_WINDOW       = 40        # control post window (same length as firing event
 MIN_POST_GAMES    = 25
 
 
+def _get_active_teams(year):
+    """Return the 30 BBRef team abbreviations for a given MLB season."""
+    base = [
+        'ARI', 'ATL', 'BAL', 'BOS', 'CHC', 'CWS', 'CIN', 'CLE',
+        'COL', 'DET', 'HOU', 'KCR', 'LAD', 'MIL', 'MIN', 'NYM',
+        'NYY', 'OAK', 'PHI', 'PIT', 'SDP', 'SEA', 'SFG', 'STL',
+        'TEX', 'TOR',
+    ]
+    base.append('LAA' if year >= 2005 else 'ANA')
+    base.append('TBR' if year >= 2008 else 'TBD')
+    base.append('MIA' if year >= 2012 else 'FLA')
+    base.append('WSN' if year >= 2005 else 'MON')
+    return base
+
+
 def build_all_team_season_windows(events, game_log, projections):
     """
-    For every non-firing team-season combination present in the game log,
-    generate 40-game windows at the same game-number as each firing event.
+    For every non-firing team-season, generate 40-game windows at the same
+    game-numbers as the firing events.
 
-    Returns a DataFrame with one row per (team, season, pseudo_game_number) window,
-    including pyth_delta, actual_wpct_pre/post, and projection residual.
+    Enumerates all 30 active teams for each season in the study period,
+    fetching game logs via the MLB Stats API cache from Phase 2.
+
+    Returns a DataFrame with one row per (team, season, pseudo_game_number) window.
     """
-    # Identify firing team-seasons to exclude from controls
     firing_keys = set(zip(events['team'], events['season']))
-
-    # Unique team-seasons in the game log (may include firing teams too — we exclude them)
-    team_seasons = (
-        game_log[['firing_id']].drop_duplicates()
-        .merge(events[['firing_id', 'team', 'season']], on='firing_id', how='left')
-    )
-    all_team_seasons = set(zip(team_seasons['team'], team_seasons['season']))
-    control_team_seasons = all_team_seasons - firing_keys
+    all_seasons  = sorted(events['season'].unique())
 
     proj_lookup = {}
     if len(projections) > 0:
         for _, row in projections.iterrows():
             proj_lookup[(str(row['team']), int(row['season']))] = row
 
-    # For each control team-season, we need their game log
-    # We'll reuse game_log rows that belong to firing events on those teams —
-    # but control team-seasons are explicitly non-firing, so their game log
-    # rows don't appear in game_log.csv (which only has firing-event windows).
-    # We therefore need to request them separately via pybaseball.
-    # To avoid heavy re-scraping, we extract the data we need from the
-    # full-season logs that were already cached during Phase 2.
-    #
-    # Strategy: for each control team-season, load the full cached log
-    # and slice a 40-game window centred at each firing event's game number.
-
-    from phase2_game_logs import _get_raw_log   # reuse the cache
+    from phase2_game_logs import _get_raw_log   # reuse the MLB API cache
 
     rows = []
     ctrl_id = 0
 
-    # Get set of pseudo-firing game numbers to match against (from firing events)
     firing_gnums = sorted(events['game_number_at_firing'].unique().tolist())
 
-    for (ctrl_team, ctrl_season) in sorted(control_team_seasons):
-        gl = _get_raw_log(ctrl_season, ctrl_team)
-        if gl is None or len(gl) == 0:
-            continue
-
-        p_row = proj_lookup.get((ctrl_team, ctrl_season))
-        proj_wpct = float(p_row['projected_wpct']) if (
-            p_row is not None and pd.notna(p_row.get('projected_wpct'))
-        ) else np.nan
-
-        for pseudo_gnum in firing_gnums:
-            pre  = gl[gl['game_number'] <= pseudo_gnum]
-            post = gl[(gl['game_number'] > pseudo_gnum)
-                      & (gl['game_number'] <= pseudo_gnum + POST_WINDOW)]
-
-            if len(post) < MIN_POST_GAMES:
+    for ctrl_season in all_seasons:
+        for ctrl_team in _get_active_teams(ctrl_season):
+            if (ctrl_team, ctrl_season) in firing_keys:
                 continue
 
-            # Metrics
-            def _wpct(sub):
-                w = (sub['result'] == 'W').sum()
-                l = (sub['result'] == 'L').sum()
-                return w / (w + l) if (w + l) > 0 else np.nan
+            gl = _get_raw_log(ctrl_season, ctrl_team)
+            if gl is None or len(gl) == 0:
+                continue
 
-            def _pyth(sub):
-                return pythagorean_wpct(
-                    sub['runs_scored'].sum(), sub['runs_allowed'].sum()
-                )
+            p_row = proj_lookup.get((ctrl_team, ctrl_season))
+            proj_wpct = float(p_row['projected_wpct']) if (
+                p_row is not None and pd.notna(p_row.get('projected_wpct'))
+            ) else np.nan
 
-            pre_pyth  = _pyth(pre)  if len(pre)  > 0 else np.nan
-            post_pyth = _pyth(post)
-            pre_act   = _wpct(pre)  if len(pre)  > 0 else np.nan
-            post_act  = _wpct(post)
+            for pseudo_gnum in firing_gnums:
+                pre  = gl[gl['game_number'] <= pseudo_gnum]
+                post = gl[(gl['game_number'] > pseudo_gnum)
+                          & (gl['game_number'] <= pseudo_gnum + POST_WINDOW)]
 
-            pyth_delta  = post_pyth - pre_pyth if not np.isnan(post_pyth) and not np.isnan(pre_pyth) else np.nan
-            actual_gap  = pre_act   - pre_pyth  if not np.isnan(pre_act)  and not np.isnan(pre_pyth) else np.nan
+                if len(post) < MIN_POST_GAMES:
+                    continue
 
-            # Projection residual at pseudo-firing date
-            res_pre = pre_act - proj_wpct if not np.isnan(pre_act) and not np.isnan(proj_wpct) else np.nan
+                def _wpct(sub):
+                    w = (sub['result'] == 'W').sum()
+                    l = (sub['result'] == 'L').sum()
+                    return w / (w + l) if (w + l) > 0 else np.nan
 
-            ctrl_id += 1
-            rows.append({
-                'ctrl_id':                 ctrl_id,
-                'ctrl_team':               ctrl_team,
-                'ctrl_season':             ctrl_season,
-                'pseudo_game_number':      pseudo_gnum,
-                'pre_games':               len(pre),
-                'post_games':              len(post),
-                'actual_wpct_pre':         pre_act,
-                'actual_wpct_post':        post_act,
-                'pyth_wpct_pre':           pre_pyth,
-                'pyth_wpct_post':          post_pyth,
-                'pyth_delta':              pyth_delta,
-                'pyth_gap_at_pseudo_fire': actual_gap,
-                'projected_wpct':          proj_wpct if not np.isnan(proj_wpct) else None,
-                'projection_residual_pre': res_pre   if not np.isnan(res_pre)   else None,
-            })
+                def _pyth(sub):
+                    return pythagorean_wpct(
+                        sub['runs_scored'].sum(), sub['runs_allowed'].sum()
+                    )
+
+                pre_pyth  = _pyth(pre)  if len(pre)  > 0 else np.nan
+                post_pyth = _pyth(post)
+                pre_act   = _wpct(pre)  if len(pre)  > 0 else np.nan
+                post_act  = _wpct(post)
+
+                pyth_delta  = post_pyth - pre_pyth if not np.isnan(post_pyth) and not np.isnan(pre_pyth) else np.nan
+                actual_gap  = pre_act   - pre_pyth  if not np.isnan(pre_act)  and not np.isnan(pre_pyth) else np.nan
+                res_pre     = pre_act - proj_wpct   if not np.isnan(pre_act)  and not np.isnan(proj_wpct) else np.nan
+
+                ctrl_id += 1
+                rows.append({
+                    'ctrl_id':                 ctrl_id,
+                    'ctrl_team':               ctrl_team,
+                    'ctrl_season':             ctrl_season,
+                    'pseudo_game_number':      pseudo_gnum,
+                    'pre_games':               len(pre),
+                    'post_games':              len(post),
+                    'actual_wpct_pre':         pre_act,
+                    'actual_wpct_post':        post_act,
+                    'pyth_wpct_pre':           pre_pyth,
+                    'pyth_wpct_post':          post_pyth,
+                    'pyth_delta':              pyth_delta,
+                    'pyth_gap_at_pseudo_fire': actual_gap,
+                    'projected_wpct':          proj_wpct if not np.isnan(proj_wpct) else None,
+                    'projection_residual_pre': res_pre   if not np.isnan(res_pre)   else None,
+                })
 
     return pd.DataFrame(rows)
 
@@ -148,7 +146,7 @@ def match_controls(events, metrics, projections, ctrl_pool):
     # Merge events with metrics and projections for matching variables
     ev_m = events.merge(
         metrics[['firing_id', 'pyth_delta', 'actual_wpct_pre', 'pyth_wpct_pre',
-                 'pyth_gap_at_firing', 'game_number_at_firing']],
+                 'pyth_gap_at_firing']],
         on='firing_id', how='left'
     )
     ev_m = ev_m.merge(

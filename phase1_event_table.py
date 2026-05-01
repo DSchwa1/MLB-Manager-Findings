@@ -22,6 +22,13 @@ from utils import (
     BASE_DIR, OUTPUT_DIR, clean_schedule_df
 )
 
+# Enable pybaseball disk cache — avoids re-hitting BBRef for the same team-season
+try:
+    import pybaseball
+    pybaseball.cache.enable()
+except Exception:
+    pass
+
 OUT_PATH = os.path.join(OUTPUT_DIR, 'event_table.csv')
 
 START_YEAR = 2000
@@ -127,7 +134,7 @@ def scrape_bbref_managers_for_year(team_bbref, year):
     return results
 
 
-# ── Game log retrieval ─────────────────────────────────────────────────────────
+# ── Game log retrieval — MLB Stats API primary, pybaseball fallback ────────────
 _game_log_cache = {}
 
 
@@ -137,42 +144,22 @@ def get_game_log(year, bbref_team):
     if key in _game_log_cache:
         return _game_log_cache[key]
 
-    df = None
-    try:
-        from pybaseball import schedule_and_record
-        raw = schedule_and_record(year, bbref_team)
-        df = clean_schedule_df(raw, year)
-    except Exception as exc:
-        log_audit(
-            f'pybaseball schedule_and_record failed for {bbref_team} {year}: {exc}. '
-            'Falling back to direct BBRef scrape.', 'WARNING'
-        )
+    # Primary: MLB Stats API (official, no scraping, no 403 risk)
+    from utils import get_mlb_game_log
+    df = get_mlb_game_log(year, bbref_team)
 
     if df is None or len(df) == 0:
-        df = _scrape_schedule_from_bbref(year, bbref_team)
+        log_audit(f'MLB API empty for {bbref_team} {year}. Trying pybaseball.', 'WARNING')
+        try:
+            from pybaseball import schedule_and_record
+            raw = schedule_and_record(year, bbref_team)
+            df = clean_schedule_df(raw, year)
+        except Exception as exc:
+            log_audit(f'pybaseball also failed for {bbref_team} {year}: {exc}', 'WARNING')
+            df = pd.DataFrame()
 
     _game_log_cache[key] = df
     return df
-
-
-def _scrape_schedule_from_bbref(year, bbref_team):
-    """Direct BBRef schedule scrape fallback."""
-    url = f'https://www.baseball-reference.com/teams/{bbref_team}/{year}-schedule.shtml'
-    resp = bbref_get(url)
-    if not resp:
-        log_audit(f'BBRef schedule scrape returned no response for {bbref_team} {year}', 'ERROR')
-        return pd.DataFrame()
-    soup = BeautifulSoup(resp.text, 'lxml')
-    table = soup.find('table', id='team_schedule')
-    if table is None:
-        log_audit(f'No #team_schedule table found for {bbref_team} {year}', 'ERROR')
-        return pd.DataFrame()
-    try:
-        df_raw = pd.read_html(str(table))[0]
-        return clean_schedule_df(df_raw, year)
-    except Exception as exc:
-        log_audit(f'Failed to parse schedule table for {bbref_team} {year}: {exc}', 'ERROR')
-        return pd.DataFrame()
 
 
 # ── is_outsider determination ──────────────────────────────────────────────────
