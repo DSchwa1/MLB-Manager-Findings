@@ -1,212 +1,110 @@
-"""Phase 4: Pull Preseason Projections.
+"""Phase 4: Preseason Quality Baseline.
 
-Coverage hierarchy (per spec):
-  2000–2005 : Marcel projected W% — expected to be unavailable; flags as null.
-  2006–2025 : ZiPS projected W% from FanGraphs; Steamer as fallback.
+Uses prior-year Pythagorean W% (from MLB Stats API final standings) as the
+preseason expected win percentage for each firing event's team.
 
-All unavailable or unmatched projections → projected_wpct = null, flagged in
-data_audit.txt.  No imputation.
+Prior-year Pythagorean W% is a well-validated, reproducible baseline for team
+quality that is available for all seasons 1999–2025, giving full coverage
+across the 2000–2025 study period.
 
 Outputs: outputs/projections_table.csv
 """
 
 import os
-import re
-import time
 import numpy as np
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
-from utils import bbref_get, log_audit, OUTPUT_DIR, HEADERS
+from utils import (
+    pythagorean_wpct, log_audit, OUTPUT_DIR,
+    BBREF_TO_MLB_ID, MLB_API_BASE,
+)
 
 EVENT_TABLE = os.path.join(OUTPUT_DIR, 'event_table.csv')
 OUT_PATH    = os.path.join(OUTPUT_DIR, 'projections_table.csv')
 
-# FanGraphs team IDs (used in some API URLs)
-FG_TEAM_IDS = {
-    'ARI': 15, 'ATL': 16, 'BAL': 2,  'BOS': 3,  'CHC': 17, 'CWS': 4,
-    'CIN': 18, 'CLE': 5,  'COL': 19, 'DET': 6,  'HOU': 21, 'KCR': 7,
-    'LAD': 22, 'LAA': 1,  'ANA': 1,  'MIA': 28, 'FLA': 28, 'MIL': 23,
-    'MIN': 8,  'MON': 27, 'NYM': 25, 'NYY': 9,  'OAK': 10, 'PHI': 26,
-    'PIT': 27, 'SDP': 29, 'SEA': 11, 'SFG': 30, 'STL': 24, 'TBR': 12,
-    'TBD': 12, 'TEX': 13, 'TOR': 14, 'WSN': 20,
-}
+# Invert BBREF_TO_MLB_ID so we can look up bbref abbrev from numeric team ID.
+# Multiple BBRef codes may map to the same MLB ID (e.g. ANA/LAA -> 108);
+# keep the most current abbreviation.
+_MLB_ID_TO_BBREF = {}
+for abbrev, mlb_id in BBREF_TO_MLB_ID.items():
+    _MLB_ID_TO_BBREF[mlb_id] = abbrev   # last write wins; later abbrevs are current
+
+_standings_cache = {}
 
 
-# ── Marcel (2000–2005) ─────────────────────────────────────────────────────────
-def get_marcel_wpct(team, year):
+def get_prior_year_standings(year):
     """
-    Marcel team-level W% projections for 2000–2005.
-
-    Marcel was designed as a player-level system and team W% aggregates were
-    never published in a consistently archived, machine-readable format.
-    Returning None and flagging for every season in this range.
+    Fetch final regular-season standings for all teams in (year).
+    Returns dict mapping MLB team ID -> {'rs': int, 'ra': int, 'w': int, 'l': int}.
     """
-    log_audit(
-        f'PROJECTION_UNAVAILABLE: Marcel team W% not available in scrapable form '
-        f'for {team} {year}. Setting projected_wpct=null.', 'PROJECTION'
-    )
-    return None, 'unavailable'
+    if year in _standings_cache:
+        return _standings_cache[year]
 
-
-# ── ZiPS via FanGraphs ─────────────────────────────────────────────────────────
-def get_zips_wpct(team, year):
-    """
-    Attempt to scrape ZiPS projected W% for team-season from FanGraphs.
-
-    FanGraphs keeps historical depth-chart / projected-standings pages.
-    We try two URL patterns:
-      1. The projections API endpoint (JSON, preferred)
-      2. The depth-charts HTML page
-    Returns (projected_wpct float or None, source str).
-    """
-    # Attempt 1: FanGraphs projections API (works for recent years)
-    api_url = (
-        f'https://www.fangraphs.com/api/projections'
-        f'?type=zips&stats=pit&pos=all&team=0&players=0&lg=all&season={year}'
-    )
-    time.sleep(2)
+    url = (f'{MLB_API_BASE}/standings'
+           f'?leagueId=103,104&season={year}&standingsTypes=regularSeason')
     try:
-        resp = requests.get(api_url, headers=HEADERS, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            # data is a list of player projection dicts; team-level W% is not
-            # directly in this endpoint. Fall through to HTML approach.
-    except Exception:
-        pass
-
-    # Attempt 2: FanGraphs projected standings / depth charts (HTML)
-    # URL pattern for historical projected standings varies; try both formats.
-    fg_team_id = FG_TEAM_IDS.get(team)
-    if fg_team_id is None:
-        log_audit(
-            f'PROJECTION_UNAVAILABLE: No FanGraphs team ID for {team} {year}.',
-            'PROJECTION'
-        )
-        return None, 'unavailable'
-
-    urls_to_try = [
-        # Post-2015 format
-        (f'https://www.fangraphs.com/depthcharts.aspx'
-         f'?position=Team&teamid={fg_team_id}&statgroup=ZiPS&type=DC&season={year}'),
-        # Older format
-        (f'https://www.fangraphs.com/projections.aspx'
-         f'?pos=all&stats=bat&type=zips&team={fg_team_id}&lg=all&players=0&season={year}'),
-    ]
-
-    for url in urls_to_try:
-        time.sleep(2)
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=20)
-            if resp.status_code != 200:
-                continue
-            wpct = _parse_fg_projected_wpct(resp.text, team, year)
-            if wpct is not None:
-                return wpct, 'ZiPS'
-        except Exception as exc:
-            log_audit(f'FanGraphs ZiPS scrape error {team} {year}: {exc}', 'WARNING')
-
-    log_audit(
-        f'PROJECTION_UNAVAILABLE: ZiPS W% not found for {team} {year} '
-        f'after trying FanGraphs URL patterns.', 'PROJECTION'
-    )
-    return None, 'unavailable'
-
-
-def _parse_fg_projected_wpct(html, team, year):
-    """
-    Attempt to extract a projected win percentage from FanGraphs HTML.
-    Returns float or None.
-    """
-    soup = BeautifulSoup(html, 'lxml')
-
-    # Look for a table or data element containing win% or projected W
-    # FanGraphs depth charts have a "Projected Record" section with W and L columns.
-    # Pattern: find cells near "W" and "L" column headers.
-    for table in soup.find_all('table'):
-        headers = [th.get_text(strip=True).lower() for th in table.find_all('th')]
-        if 'w' in headers and 'l' in headers:
-            try:
-                df = pd.read_html(str(table))[0]
-                df.columns = [str(c).lower().strip() for c in df.columns]
-                if 'w' in df.columns and 'l' in df.columns:
-                    # Sum projected W and L across all rows (team totals)
-                    w = pd.to_numeric(df['w'], errors='coerce').sum()
-                    l = pd.to_numeric(df['l'], errors='coerce').sum()
-                    if w > 0 or l > 0:
-                        return w / (w + l)
-            except Exception:
-                pass
-
-    # Also check for text like "82-80" or "W% .509"
-    text = soup.get_text(' ')
-    wpct_match = re.search(r'W%[:\s]+\.?([0-9]{3,4})', text)
-    if wpct_match:
-        val = float('0.' + wpct_match.group(1).lstrip('0') or '0')
-        if 0.2 < val < 0.8:
-            return val
-
-    return None
-
-
-# ── Steamer via FanGraphs (fallback) ──────────────────────────────────────────
-def get_steamer_wpct(team, year):
-    """
-    Try Steamer projected W% from FanGraphs as ZiPS fallback.
-    Steamer available on FanGraphs ~2013+.
-    """
-    if year < 2013:
-        log_audit(
-            f'PROJECTION_UNAVAILABLE: Steamer not available before 2013. '
-            f'{team} {year} projected_wpct=null.', 'PROJECTION'
-        )
-        return None, 'unavailable'
-
-    fg_team_id = FG_TEAM_IDS.get(team)
-    if fg_team_id is None:
-        return None, 'unavailable'
-
-    url = (f'https://www.fangraphs.com/depthcharts.aspx'
-           f'?position=Team&teamid={fg_team_id}&statgroup=Steamer&type=DC&season={year}')
-    time.sleep(2)
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=20)
-        if resp.status_code == 200:
-            wpct = _parse_fg_projected_wpct(resp.text, team, year)
-            if wpct is not None:
-                return wpct, 'Steamer'
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as exc:
-        log_audit(f'Steamer scrape error {team} {year}: {exc}', 'WARNING')
+        log_audit(f'MLB API standings error for {year}: {exc}', 'ERROR')
+        _standings_cache[year] = {}
+        return {}
 
-    log_audit(
-        f'PROJECTION_UNAVAILABLE: Steamer W% not found for {team} {year}.',
-        'PROJECTION'
-    )
-    return None, 'unavailable'
+    result = {}
+    for division in data.get('records', []):
+        for tr in division.get('teamRecords', []):
+            tid = tr['team']['id']
+            result[tid] = {
+                'w':  tr.get('wins', 0),
+                'l':  tr.get('losses', 0),
+                'rs': tr.get('runsScored', 0),
+                'ra': tr.get('runsAllowed', 0),
+            }
+
+    _standings_cache[year] = result
+    return result
 
 
-# ── Dispatch per-event ─────────────────────────────────────────────────────────
-def get_projection(team, year):
+def get_prior_year_pyth(team_bbref, season):
     """
-    Apply coverage hierarchy and return (projected_wpct, projection_source).
+    Return prior-year Pythagorean W% for team_bbref entering (season).
+    Uses final standings from (season - 1).
+    Returns (float or None, source_str).
     """
-    if year <= 2005:
-        return get_marcel_wpct(team, year)
+    prior_year = season - 1
+    mlb_id = BBREF_TO_MLB_ID.get(team_bbref)
+    if mlb_id is None:
+        log_audit(
+            f'PROJECTION_UNAVAILABLE: No MLB team ID for {team_bbref}. '
+            f'projected_wpct=null.', 'PROJECTION'
+        )
+        return None, 'unavailable'
 
-    # Try ZiPS first
-    wpct, source = get_zips_wpct(team, year)
-    if wpct is not None:
-        return wpct, source
+    standings = get_prior_year_standings(prior_year)
+    record = standings.get(mlb_id)
+    if record is None:
+        log_audit(
+            f'PROJECTION_UNAVAILABLE: {team_bbref} (id={mlb_id}) not found in '
+            f'{prior_year} standings. projected_wpct=null.', 'PROJECTION'
+        )
+        return None, 'unavailable'
 
-    # Steamer fallback
-    wpct, source = get_steamer_wpct(team, year)
-    return wpct, source
+    rs, ra = record['rs'], record['ra']
+    if rs == 0 and ra == 0:
+        log_audit(
+            f'PROJECTION_UNAVAILABLE: Zero runs for {team_bbref} {prior_year}. '
+            f'projected_wpct=null.', 'PROJECTION'
+        )
+        return None, 'unavailable'
+
+    pyth = pythagorean_wpct(rs, ra)
+    return pyth, f'prior_year_pyth_{prior_year}'
 
 
-# ── Main ───────────────────────────────────────────────────────────────────────
 def run():
-    print("Phase 4: Pulling preseason projections ...")
+    print("Phase 4: Computing preseason quality baselines (prior-year Pythagorean W%) ...")
     log_audit('='*60, 'PHASE4_START')
 
     if not os.path.exists(EVENT_TABLE):
@@ -216,7 +114,6 @@ def run():
     events = pd.read_csv(EVENT_TABLE)
     print(f"  Loaded {len(events)} events from event_table.csv")
 
-    # Load metrics for actual W% values
     metrics_path = os.path.join(OUTPUT_DIR, 'metrics_table.csv')
     if os.path.exists(metrics_path):
         metrics = pd.read_csv(metrics_path)
@@ -224,7 +121,6 @@ def run():
         log_audit('Phase 4: metrics_table.csv not found; residuals cannot be calculated.', 'WARNING')
         metrics = pd.DataFrame()
 
-    # Cache projections by (team, year) to avoid duplicate scrapes
     proj_cache = {}
     records = []
 
@@ -235,13 +131,12 @@ def run():
         key  = (team, year)
 
         if key not in proj_cache:
-            print(f"    Fetching projection: {team} {year} ...")
-            wpct, source = get_projection(team, year)
+            print(f"    {team} {year}: fetching prior-year ({year-1}) Pythagorean W% ...")
+            wpct, source = get_prior_year_pyth(team, year)
             proj_cache[key] = (wpct, source)
         else:
             wpct, source = proj_cache[key]
 
-        # Look up actual W% for residual calculation
         if len(metrics) > 0:
             m_row = metrics[metrics['firing_id'] == fid]
             actual_pre  = m_row['actual_wpct_pre'].iloc[0]  if len(m_row) else np.nan
@@ -259,33 +154,30 @@ def run():
         res_delta = res_post    - res_pre if not np.isnan(res_post)   and not np.isnan(res_pre) else np.nan
 
         records.append({
-            'firing_id':                fid,
-            'team':                     team,
-            'season':                   year,
-            'projected_wpct':           wpct_f if not np.isnan(wpct_f) else None,
-            'projection_source':        source,
-            'projection_residual_pre':  res_pre   if not np.isnan(res_pre)   else None,
-            'projection_residual_post': res_post  if not np.isnan(res_post)  else None,
+            'firing_id':                 fid,
+            'team':                      team,
+            'season':                    year,
+            'projected_wpct':            wpct_f if not np.isnan(wpct_f) else None,
+            'projection_source':         source,
+            'projection_residual_pre':   res_pre   if not np.isnan(res_pre)   else None,
+            'projection_residual_post':  res_post  if not np.isnan(res_post)  else None,
             'projection_residual_delta': res_delta if not np.isnan(res_delta) else None,
         })
 
     df_out = pd.DataFrame(records)
     df_out.to_csv(OUT_PATH, index=False)
 
-    n          = len(df_out)
-    n_avail    = df_out['projected_wpct'].notna().sum()
-    n_unavail  = n - n_avail
+    n_avail   = df_out['projected_wpct'].notna().sum()
+    n_unavail = len(df_out) - n_avail
     src_counts = df_out['projection_source'].value_counts().to_dict()
 
-    print(f"Phase 4 complete — {n} records written to projections_table.csv")
-    print(f"  Projection coverage: {n_avail}/{n} events have projected_wpct")
+    print(f"Phase 4 complete — {len(df_out)} records written to projections_table.csv")
+    print(f"  Coverage: {n_avail}/{len(df_out)} events have projected_wpct")
     print(f"  Sources: {src_counts}")
 
     log_audit(
-        f'Phase 4 complete. {n} projection records. {n_avail} with projected_wpct. '
-        f'{n_unavail} unavailable. Sources: {src_counts}. '
-        f'NOTE: FanGraphs HTML structure varies by year — manual verification of '
-        f'projection values strongly recommended, especially 2006–2014.',
+        f'Phase 4 complete. {len(df_out)} projection records. {n_avail} with '
+        f'projected_wpct. {n_unavail} unavailable. Sources: {src_counts}.',
         'PHASE4_END'
     )
 
